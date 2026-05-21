@@ -1,0 +1,29 @@
+Schritte:
+
+1: 	minio-backup.sh und lifecycle.json in Home-Verzeichnis auf Server kopieren
+	Variable in Script anpassen
+	Script in Verzeichnis /usr/local/bin/ kopieren
+	sudo cp minio-backup.sh /usr/local/bin/
+	Script ausführbar machen
+	sudo chmod +x /usr/local/bin/minio-backup.sh
+
+2:	mc alias erstellen oder prüfen ob vorhanden
+	- localminio
+	- strato
+
+3: 	Bucket auf strato muss vorhanden sein
+
+4:	Versionierung aktivieren
+	mc version enable strato/stadt-XYZ-minio
+	
+5: 	lifecycle.json anwenden
+	mc ilm import strato/stadt-XYZ-minio < lifecycle.json
+	
+6:	Crontab einrichten
+	sudo nano /etc/crontab
+	Backup täglich um 3 Uhr
+	0 3 * * * /usr/local/bin/minio-backup.sh
+	
+7: Backup zum testen einmal manuell ausführen
+
+8: fertig
