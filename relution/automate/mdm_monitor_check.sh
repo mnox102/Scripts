@@ -164,6 +164,21 @@ human_age() {
     fi
 }
 
+# Prüft, ob eine web.yml einen gültigen bcrypt-Hash enthält (Hash wird nicht ausgegeben)
+check_webyml() {
+    local f="$1"
+    [[ -z "$f" ]] && return 0
+    if ! $SUDO test -f "$f"; then
+        log_err "web.yml nicht gefunden: ${f}"
+        todo "web.yml mit basic_auth_users anlegen (Konzept Schritt 5.1)"
+    elif $SUDO grep -qE '^[[:space:]]+[A-Za-z0-9_-]+:[[:space:]]*\$2[aby]\$' "$f"; then
+        log_ok "web.yml enthält einen bcrypt-Hash (${f})"
+    else
+        log_err "web.yml ohne gültigen Passwort-Hash (${f}) — z.B. weil htpasswd fehlte"
+        todo "Hash neu erzeugen: 'htpasswd -nbBC 12 \"\" <Passwort> | tr -d \":\\n\"' und in ${f} eintragen"
+    fi
+}
+
 # Prüft, ob ein systemd-Dienst nach wg-quick@wg0 startet
 check_wg_order() {
     local unit="$1" after
@@ -213,7 +228,7 @@ if [[ -f "$WG_CONF" ]] || $SUDO test -f "$WG_CONF" 2>/dev/null; then
 fi
 
 if command -v docker &>/dev/null && $SUDO docker info &>/dev/null; then
-    RELUTION_CTR="$($SUDO docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($0) ~ /relution/ && tolower($0) !~ /nginx|mariadb|mysql|minio|prometheus/ {print $1; exit}')"
+    RELUTION_CTR="$($SUDO docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /(^|\/)relution(:|$)/ {print $1; exit}')"
     PROM_CTR="$($SUDO docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /prom\/prometheus/ {print $1; exit}')"
 fi
 
@@ -291,6 +306,34 @@ case "$OS_FAMILY" in
         ;;
 esac
 
+# Benötigte Werkzeuge für die Einrichtung je Rolle (nur Prüfung, keine Installation)
+# Format: "Befehl:Debian-Paket:RHEL-Paket"
+case "$ROLE" in
+    grafana)  NEEDED_TOOLS=("wg:wireguard:wireguard-tools" "nft:nftables:nftables" "promtool:prometheus:prometheus" "openssl:openssl:openssl") ;;
+    relution) NEEDED_TOOLS=("wg:wireguard:wireguard-tools" "htpasswd:apache2-utils:httpd-tools" "openssl:openssl:openssl")
+              [[ "$RELUTION_MODE" == "nativ" ]] && NEEDED_TOOLS+=("promtool:prometheus:prometheus") ;;
+    wazuh)    NEEDED_TOOLS=("openssl:openssl:openssl") ;;
+    *)        NEEDED_TOOLS=() ;;
+esac
+MISSING_PKGS=()
+for entry in "${NEEDED_TOOLS[@]}"; do
+    IFS=':' read -r tool pkg_deb pkg_rhel <<<"$entry"
+    if command -v "$tool" &>/dev/null; then
+        log_ok "Werkzeug vorhanden: ${tool}"
+    else
+        pkg="$pkg_deb"; [[ "$OS_FAMILY" == "rhel" ]] && pkg="$pkg_rhel"
+        log_warn "Werkzeug fehlt: ${tool} (Paket ${pkg})"
+        MISSING_PKGS+=("$pkg")
+    fi
+done
+if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        todo "Fehlende Pakete installieren: 'dnf install -y ${MISSING_PKGS[*]}'"
+    else
+        todo "Fehlende Pakete installieren: 'apt install -y ${MISSING_PKGS[*]}'"
+    fi
+fi
+
 # ---------- Schritt 3: Netzwerk, WireGuard und Firewall ----------
 log_step "Netzwerk, WireGuard und Firewall"
 
@@ -348,6 +391,10 @@ else
             fi
         done < <($SUDO wg show wg0 latest-handshakes 2>/dev/null)
         [[ $HS_COUNT -eq 0 ]] && log_warn "Noch keine Peers aktiv"
+        if [[ -n "${PEER_COUNT:-}" && "$HS_COUNT" -ne "$PEER_COUNT" ]]; then
+            log_warn "${PEER_COUNT} Peers in ${WG_CONF}, aber ${HS_COUNT} im laufenden Interface geladen"
+            todo "Konfiguration übernehmen: 'wg syncconf wg0 <(wg-quick strip wg0)' bzw. überzählige Peer-Blöcke prüfen"
+        fi
     fi
 fi
 
@@ -431,7 +478,7 @@ grafana)
             todo "Tabs in ${f} durch Leerzeichen ersetzen"
         fi
         # Datenquellen: Name und URL (keine Passwörter)
-        while read -r name url; do
+        while IFS=$'\t' read -r name url; do
             [[ -z "$name" ]] && continue
             CODE="$(http_code "${url%/}/-/healthy")"
             case "$CODE" in
@@ -445,7 +492,7 @@ grafana)
                 *)        log_err "  Datenquelle ${name}: ${url} nicht erreichbar (HTTP ${CODE})"
                           todo "Datenquelle ${name}: Tunnel/Prometheus auf ${url} prüfen" ;;
             esac
-        done < <(awk '/^[[:space:]]*- name:/{sub(/.*name:[[:space:]]*/,""); n=$0} /^[[:space:]]*url:/{sub(/.*url:[[:space:]]*/,""); print n, $0}' "$f" 2>/dev/null)
+        done < <(awk '/^[[:space:]]*- name:/{sub(/.*name:[[:space:]]*/,""); n=$0} /^[[:space:]]*url:/{sub(/.*url:[[:space:]]*/,""); print n "\t" $0}' "$f" 2>/dev/null)
         # Verwendete Umgebungsvariablen müssen definiert sein (Werte werden nicht angezeigt)
         for var in $(grep -oE '\$\{[A-Za-z0-9_]+\}' "$f" 2>/dev/null | tr -d '${}' | sort -u); do
             if $SUDO grep -qE "^[[:space:]]*${var}=" "$ENV_FILE" 2>/dev/null; then
@@ -476,12 +523,23 @@ grafana)
         *)       log_err "Grafana über Caddy nicht erreichbar (HTTP ${CODE})" ;;
     esac
 
-    report_svc "Prometheus (lokal)" prometheus && log_info "Port 9090:  $(listen_addr 9090)"
+    if report_svc "Prometheus (lokal)" prometheus; then
+        log_info "Port 9090:  $(listen_addr 9090)"
+        if [[ "$(listen_addr 9090)" != "127.0.0.1:9090" ]]; then
+            log_warn "Lokales Prometheus lauscht nicht nur auf 127.0.0.1"
+            todo "In /etc/default/prometheus ARGS um '--web.listen-address=127.0.0.1:9090' ergänzen, dann 'systemctl restart prometheus'"
+        fi
+    fi
     report_svc "blackbox_exporter" prometheus-blackbox-exporter
     report_svc "node_exporter" prometheus-node-exporter
     if [[ -f /etc/prometheus/prometheus.yml ]]; then
         while read -r line; do log_info "Scrape-Job: ${line}"; done < <(awk '/job_name:/{sub(/.*job_name:[[:space:]]*/,""); print}' /etc/prometheus/prometheus.yml)
         grep -q '/probe' /etc/prometheus/prometheus.yml || todo "blackbox-Job für die Relution-URLs anlegen (Konzept Schritt 3.4)"
+        if grep -qE 'localhost:9100|127\.0\.0\.1:9100' /etc/prometheus/prometheus.yml \
+           && [[ "$(grep -cE 'localhost:9100|127\.0\.0\.1:9100' /etc/prometheus/prometheus.yml)" -gt 1 ]]; then
+            log_warn "node_exporter wird in mehreren Jobs doppelt abgefragt"
+            todo "Doppelten node_exporter-Job (z.B. Standard-Job 'node') aus /etc/prometheus/prometheus.yml entfernen"
+        fi
     else
         todo "Lokales Prometheus mit blackbox einrichten (Konzept Schritt 3.4)"
     fi
@@ -500,6 +558,8 @@ relution)
             PROM_ARGS="$($SUDO docker inspect "$PROM_CTR" --format '{{join .Args " "}}' 2>/dev/null)"
             [[ "$PROM_ARGS" == *web.config.file* ]] && log_ok "Prometheus: Basic Auth konfiguriert (--web.config.file)" \
                 || { log_err "Prometheus ohne --web.config.file (keine Basic Auth)"; todo "web.yml mit basic_auth_users einbinden (Konzept Schritt 5.1)"; }
+            WEBYML_SRC="$($SUDO docker inspect "$PROM_CTR" --format '{{range .Mounts}}{{if eq .Destination "/etc/prometheus/web.yml"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)"
+            check_webyml "$WEBYML_SRC"
             [[ "$PROM_ARGS" == *retention.size* ]] && log_ok "Prometheus: Größenlimit gesetzt" \
                 || { log_warn "Prometheus ohne --storage.tsdb.retention.size"; todo "'--storage.tsdb.retention.size=5GB' ergänzen"; }
             if $SUDO docker exec "$PROM_CTR" wget -q -T 3 -O /dev/null "http://${RELUTION_CTR}:8099/actuator/health" &>/dev/null; then
@@ -511,6 +571,9 @@ relution)
         check_wg_order docker.service
     else
         report_svc "Prometheus" prometheus
+        if grep -q 'web.config.file' /etc/default/prometheus 2>/dev/null; then
+            check_webyml "$(grep -oE 'web.config.file=[^ "]+' /etc/default/prometheus | cut -d= -f2)"
+        fi
         CODE="$(http_code http://127.0.0.1:8099/actuator/health)"
         [[ "$CODE" == "200" ]] && log_ok "Relution-Actuator lokal erreichbar (127.0.0.1:8099)" \
             || { log_warn "Relution-Actuator auf 127.0.0.1:8099 antwortet nicht (HTTP ${CODE})"; todo "Actuator-Port der nativen Relution klären (Konzept Schritt 5.4)"; }
