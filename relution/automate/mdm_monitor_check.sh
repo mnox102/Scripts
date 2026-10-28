@@ -2,6 +2,7 @@
 
 # Prüfskript für das Monitoring-/SIEM-Setup (Konzept v2, WireGuard-Hub auf grafana-mdm).
 # Erkennt die Rolle des Servers (grafana-mdm, Wazuh-Server, Relution Docker/nativ),
+# prüft zusätzlich den Härtungsstand (offene Ports, SSH, Updates, Dateirechte, Images),
 # zeigt Systemdaten und Patchstand, listet alle Konfigurationen zu WireGuard,
 # Firewall, Grafana/Prometheus und Wazuh und nennt die nächsten Schritte.
 # Ändert nichts am System. Schlüssel und Passwörter werden nie ausgegeben.
@@ -37,7 +38,7 @@ readonly HUB_IP="10.66.0.1"
 readonly TUNNEL_NET="10.66.0.0/24"
 
 STEP_NUM=0
-TOTAL_STEPS=6   # bei jedem neuen log_step anpassen!
+TOTAL_STEPS=7   # bei jedem neuen log_step anpassen!
 
 ROLE="unbekannt"
 RELUTION_MODE=""
@@ -562,10 +563,28 @@ relution)
             check_webyml "$WEBYML_SRC"
             [[ "$PROM_ARGS" == *retention.size* ]] && log_ok "Prometheus: Größenlimit gesetzt" \
                 || { log_warn "Prometheus ohne --storage.tsdb.retention.size"; todo "'--storage.tsdb.retention.size=5GB' ergänzen"; }
-            if $SUDO docker exec "$PROM_CTR" wget -q -T 3 -O /dev/null "http://${RELUTION_CTR}:8099/actuator/health" &>/dev/null; then
-                log_ok "Relution-Actuator aus dem Prometheus-Container erreichbar (${RELUTION_CTR}:8099)"
+            PROM_STATE="$($SUDO docker inspect "$PROM_CTR" --format '{{.State.Status}}' 2>/dev/null)"
+            if [[ "$PROM_STATE" != "running" ]]; then
+                log_err "Prometheus-Container ${PROM_CTR} läuft nicht (Status: ${PROM_STATE:-unbekannt})"
+                todo "Prometheus starten: 'cd ${COMPOSE_DIR:-/opt/relution} && docker compose up -d --no-deps prometheus' (vorher Handshake prüfen)"
             else
-                log_warn "Relution-Actuator aus dem Prometheus-Container nicht prüfbar/erreichbar"
+                # Service-Name statt Containername: Unterstrich im Hostnamen führt bei Tomcat zu 400
+                RELUTION_SVC="$($SUDO docker inspect "$RELUTION_CTR" --format '{{ index .Config.Labels "com.docker.compose.service" }}' 2>/dev/null)"
+                RELUTION_HOST="${RELUTION_SVC:-relution}"
+                if ACT_OUT="$($SUDO docker exec "$PROM_CTR" wget -q -T 3 -O /dev/null "http://${RELUTION_HOST}:8099/actuator/prometheus" 2>&1)"; then
+                    log_ok "Relution-Metriken aus dem Prometheus-Container abrufbar (${RELUTION_HOST}:8099)"
+                elif [[ "$ACT_OUT" == *404* ]]; then
+                    log_warn "Relution-Actuator gibt /actuator/prometheus nicht frei (404)"
+                    todo "Wartungsfenster: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus im Service ${RELUTION_HOST}, danach ggf. 'docker compose restart nginx'"
+                else
+                    log_warn "Relution-Actuator aus dem Prometheus-Container nicht erreichbar (${RELUTION_HOST}:8099)"
+                fi
+                if $SUDO docker exec "$PROM_CTR" wget -q -T 3 -O /dev/null "http://host.docker.internal:9100/metrics" &>/dev/null; then
+                    log_ok "node_exporter aus dem Prometheus-Container erreichbar"
+                else
+                    log_err "node_exporter aus dem Prometheus-Container nicht erreichbar (host.docker.internal:9100)"
+                    todo "ufw-Regel: 'ufw allow from 172.16.0.0/12 to 172.17.0.1 port 9100 proto tcp'; extra_hosts host-gateway prüfen"
+                fi
             fi
         fi
         check_wg_order docker.service
@@ -577,6 +596,15 @@ relution)
         CODE="$(http_code http://127.0.0.1:8099/actuator/health)"
         [[ "$CODE" == "200" ]] && log_ok "Relution-Actuator lokal erreichbar (127.0.0.1:8099)" \
             || { log_warn "Relution-Actuator auf 127.0.0.1:8099 antwortet nicht (HTTP ${CODE})"; todo "Actuator-Port der nativen Relution klären (Konzept Schritt 5.4)"; }
+        if [[ "$CODE" == "200" ]]; then
+            CODE="$(http_code http://127.0.0.1:8099/actuator/prometheus)"
+            case "$CODE" in
+                200) log_ok "Relution-Metriken freigegeben (/actuator/prometheus)" ;;
+                404) log_warn "Relution-Actuator gibt /actuator/prometheus nicht frei (404)"
+                     todo "Wartungsfenster: management-Block idempotent in /opt/relution/application.yml ergänzen, Relution neu starten" ;;
+                *)   log_warn "/actuator/prometheus liefert HTTP ${CODE}" ;;
+            esac
+        fi
         check_wg_order prometheus.service
     fi
 
@@ -590,6 +618,7 @@ relution)
             todo "Prometheus nur an ${TUNNEL_IP}:9090 binden (Konzept Schritt 5.2/5.3)"
         else
             log_err "Port 9090 lauscht nicht"
+            todo "Prometheus starten und an ${TUNNEL_IP}:9090 binden (Handshake vorher prüfen)"
         fi
         CODE="$(http_code "http://${TUNNEL_IP}:9090/-/healthy")"
         case "$CODE" in
@@ -665,7 +694,149 @@ relution)
     ;;
 esac
 
-# ---------- Schritt 6: Zusammenfassung ----------
+# ---------- Schritt 6: Härtung ----------
+log_step "Härtung (offene Ports, SSH, Updates, Rechte, Images)"
+
+# 6.1 Öffentlich lauschende Dienste
+# Erlaubt je Rolle; alles andere auf einer nicht-internen Adresse wird gemeldet.
+case "$ROLE" in
+    relution) ALLOWED_PORTS=" 22 80 443 " ;;
+    grafana)  ALLOWED_PORTS=" 22 80 443 " ;;
+    wazuh)    ALLOWED_PORTS=" 22 443 1514 1515 " ;;
+    *)        ALLOWED_PORTS=" 22 80 443 " ;;
+esac
+PUBLIC_FOUND=0
+while read -r laddr proc; do
+    port="${laddr##*:}"
+    addr="${laddr%:*}"
+    addr="${addr#[}"; addr="${addr%]}"
+    # interne Adressen überspringen: localhost, Tunnel, Docker-Bridges, LAN
+    case "$addr" in
+        127.*|::1|10.66.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;;
+    esac
+    [[ "$ALLOWED_PORTS" == *" ${port} "* ]] && continue
+    PUBLIC_FOUND=1
+    if [[ "$proc" == *docker-proxy* ]]; then
+        log_err "Port ${port} öffentlich über Docker (${laddr}) — Docker umgeht ufw"
+        todo "Port ${port}: in docker-compose.yml an 127.0.0.1 binden oder 'ports:' entfernen, dann 'docker compose up -d --no-deps <service>'"
+    else
+        log_warn "Port ${port} lauscht auf ${laddr} (${proc:-?}) — nur durch Firewall geschützt"
+        todo "Port ${port}: Dienst an localhost/Tunnel binden oder per ufw/nftables auf Admin-Netze beschränken"
+    fi
+done < <(ss -tlnpH 2>/dev/null | awk '{p=$6; sub(/.*\(\("/,"",p); sub(/".*/,"",p); print $4, p}' | sort -u)
+[[ $PUBLIC_FOUND -eq 0 ]] && log_ok "Keine unerwarteten öffentlich lauschenden Ports (erlaubt:${ALLOWED_PORTS})"
+
+# 6.2 SSH
+if command -v sshd &>/dev/null; then
+    SSHD_CFG="$($SUDO sshd -T 2>/dev/null)"
+    ROOTLOGIN="$(awk '/^permitrootlogin /{print $2}' <<<"$SSHD_CFG")"
+    PWAUTH="$(awk '/^passwordauthentication /{print $2}' <<<"$SSHD_CFG")"
+    case "$ROOTLOGIN" in
+        no)               log_ok "SSH: Root-Login deaktiviert" ;;
+        prohibit-password|without-password) log_warn "SSH: Root-Login nur mit Schlüssel erlaubt"
+                          todo "SSH: 'PermitRootLogin no' setzen (persönliche Konten + sudo)" ;;
+        *)                log_err "SSH: Root-Login erlaubt (${ROOTLOGIN:-unbekannt})"
+                          todo "SSH: 'PermitRootLogin no' setzen" ;;
+    esac
+    if [[ "$PWAUTH" == "no" ]]; then
+        log_ok "SSH: Passwort-Anmeldung deaktiviert"
+    else
+        log_warn "SSH: Passwort-Anmeldung erlaubt"
+        todo "SSH: Schlüssel hinterlegen, dann 'PasswordAuthentication no' und 'systemctl reload ssh'"
+    fi
+    if command -v ufw &>/dev/null && $SUDO ufw status 2>/dev/null | grep -q 'Status: active'; then
+        if $SUDO ufw status 2>/dev/null | grep -E '^(22(/tcp)?|OpenSSH)[[:space:]]' | grep -q 'Anywhere'; then
+            log_warn "SSH (22) per ufw für alle Quellen freigegeben"
+            todo "SSH per ufw auf Admin-IPs bzw. VPN-Pool beschränken"
+        else
+            log_ok "SSH nicht für alle Quellen freigegeben (ufw)"
+        fi
+    fi
+fi
+
+# 6.3 Brute-Force-Schutz
+if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    log_ok "fail2ban aktiv"
+elif systemctl is-active --quiet crowdsec 2>/dev/null; then
+    log_ok "CrowdSec aktiv"
+elif systemctl is-active --quiet imunify360 2>/dev/null; then
+    log_ok "Imunify360 aktiv"
+else
+    log_warn "Kein Brute-Force-Schutz aktiv (fail2ban/CrowdSec)"
+    todo "fail2ban oder CrowdSec installieren (mindestens für SSH)"
+fi
+
+# 6.4 Automatische Sicherheitsupdates und Laufzeit
+if [[ "$OS_FAMILY" == "debian" ]]; then
+    if dpkg-query -W -f='${db:Status-Status}' unattended-upgrades 2>/dev/null | grep -q installed \
+       && grep -qE 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+        log_ok "unattended-upgrades aktiv"
+    else
+        log_warn "Automatische Sicherheitsupdates nicht aktiv"
+        todo "'apt install unattended-upgrades && dpkg-reconfigure -plow unattended-upgrades'"
+    fi
+elif [[ "$OS_FAMILY" == "rhel" ]]; then
+    if systemctl is-enabled --quiet dnf-automatic.timer 2>/dev/null || systemctl is-enabled --quiet dnf-automatic-install.timer 2>/dev/null; then
+        log_ok "dnf-automatic aktiv"
+    else
+        log_warn "Automatische Sicherheitsupdates nicht aktiv"
+        todo "dnf-automatic einrichten (upgrade_type = security)"
+    fi
+fi
+UPTIME_DAYS=$(( $(cut -d. -f1 /proc/uptime) / 86400 ))
+if (( UPTIME_DAYS > 90 )); then
+    log_warn "Letzter Neustart vor ${UPTIME_DAYS} Tagen — Kernel-Updates wirken erst nach Reboot"
+else
+    log_ok "Letzter Neustart vor ${UPTIME_DAYS} Tagen"
+fi
+
+# 6.5 Dateirechte für Zugangsdaten und Schlüssel
+check_secret_file() {
+    local f="$1" perm
+    $SUDO test -f "$f" || return 0
+    perm="$($SUDO stat -c '%a' "$f" 2>/dev/null)"
+    if (( (8#${perm:-0} & 8#007) != 0 )); then
+        log_err "${f} ist für alle lesbar/schreibbar (${perm}, $(perm_of "$f"))"
+        todo "Rechte einschränken: 'chmod o-rwx ${f}' (Schlüssel: chown root:root, chmod 600)"
+    elif (( (8#${perm:-0} & 8#020) != 0 )); then
+        log_warn "${f} ist für die Gruppe schreibbar (${perm}, $(perm_of "$f"))"
+        todo "Rechte einschränken: 'chmod g-w ${f}'"
+    else
+        log_ok "Rechte in Ordnung: ${f} (${perm})"
+    fi
+}
+SECRET_FILES=()
+if [[ "$ROLE" == "relution" ]]; then
+    for d in /opt/relution "${COMPOSE_DIR:-}"; do
+        [[ -n "$d" && -d "$d" ]] || continue
+        while IFS= read -r f; do SECRET_FILES+=("$f"); done < <(
+            $SUDO find "$d" -maxdepth 2 -type f \( -name 'application*.yml' -o -name '.env' -o -name '*.key' -o -name 'relution.cnf' \) 2>/dev/null
+            $SUDO find "$d" -maxdepth 2 -type f \( -name '*.pem' -o -name 'docker-compose*.yml' \) -exec $SUDO grep -lE 'PRIVATE KEY|PASSWORD|SECRET|_KEY=' {} + 2>/dev/null
+        )
+    done
+elif [[ "$ROLE" == "grafana" ]]; then
+    SECRET_FILES=(/etc/default/grafana-server /etc/grafana/provisioning/datasources/monitoring.yml /etc/wireguard/wg0.conf)
+fi
+mapfile -t SECRET_FILES < <(printf '%s\n' "${SECRET_FILES[@]}" | sort -u | grep -v '^$')
+[[ ${#SECRET_FILES[@]} -eq 0 ]] && log_info "Keine Dateien mit Zugangsdaten gefunden"
+for f in "${SECRET_FILES[@]}"; do check_secret_file "$f"; done
+
+# 6.6 Docker: Images mit :latest und Gruppenmitglieder
+if command -v docker &>/dev/null && $SUDO docker info &>/dev/null; then
+    LATEST_IMGS="$($SUDO docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk '$2 ~ /:latest$/ || $2 !~ /:/ {print $1" ("$2")"}' | paste -sd',' -)"
+    if [[ -n "$LATEST_IMGS" ]]; then
+        log_warn "Container ohne feste Version: ${LATEST_IMGS//,/, }"
+        todo "Images auf feste Versionen pinnen (Neuerstellung kann sonst ungeplant updaten)"
+    else
+        log_ok "Alle Container mit fester Image-Version"
+    fi
+    DOCKER_MEMBERS="$(getent group docker | cut -d: -f4)"
+    [[ -n "$DOCKER_MEMBERS" ]] && log_info "Mitglieder der Gruppe docker (root-gleich): ${DOCKER_MEMBERS}"
+fi
+SUDO_MEMBERS="$(getent group sudo wheel 2>/dev/null | cut -d: -f4 | paste -sd',' - | sed 's/^,//;s/,$//')"
+[[ -n "$SUDO_MEMBERS" ]] && log_info "Mitglieder sudo/wheel: ${SUDO_MEMBERS} — ehemalige Bearbeiter entfernen"
+
+# ---------- Schritt 7: Zusammenfassung ----------
 log_step "Zusammenfassung und nächste Schritte"
 
 case "$ROLE" in
