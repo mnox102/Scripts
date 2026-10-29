@@ -40,6 +40,7 @@ PROXY_PORT=""                # z.B. "3128"
 NO_PROXY_EXTRA=""            # weitere Ausnahmen, kommagetrennt, z.B. ".example.de"
 
 RELUTION_IMAGE="relution/relution:latest"    # nach erstem Start auf Version >= 26.0 pinnen
+MAX_UPLOAD="4G"              # max. Größe einer hochgeladenen App (nginx client_max_body_size)
 # ==========================================================
 
 # ---------- Farben / Formatierung ----------
@@ -328,7 +329,14 @@ sed -i -E "s/server_name[^;]*;/server_name ${SERVER_NAMES};/g" "$NGX"
 grep -q "server_name ${SERVER_NAMES};" "$NGX" || fail "server_name in relution-nginx.conf nicht gefunden – Template hat sich geändert."
 log_ok "nginx: server_name ${SERVER_NAMES}"
 grep -q 'X-Forwarded-Proto' "$NGX"   || log_warn "nginx-Template setzt kein X-Forwarded-Proto – Login kann scheitern."
-grep -q 'client_max_body_size' "$NGX" || log_warn "nginx-Template ohne client_max_body_size – große App-Uploads können mit 413 scheitern."
+# Upload-Limit: nginx-Standard (1 MB) bzw. Template-Wert reicht für App-Pakete nicht -> 413
+if grep -q 'client_max_body_size' "$NGX"; then
+    sed -i -E "s/client_max_body_size[^;]*;/client_max_body_size ${MAX_UPLOAD};/g" "$NGX"
+else
+    sed -i -E "s/^([[:space:]]*)(server_name[^;]*;)/\1\2\n\1client_max_body_size ${MAX_UPLOAD};/" "$NGX"
+fi
+grep -q "client_max_body_size ${MAX_UPLOAD};" "$NGX" || fail "client_max_body_size konnte nicht gesetzt werden – relution-nginx.conf manuell anpassen."
+log_ok "nginx: Upload-Limit ${MAX_UPLOAD} (client_max_body_size)"
 
 # ---------- Schritt 6: Secrets, Zertifikate, compose.yaml ----------
 log_step "Secrets, Zertifikate und compose.yaml schreiben"
