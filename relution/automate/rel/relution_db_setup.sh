@@ -155,7 +155,7 @@ if [[ $EUID -eq 0 ]]; then
     SUDO=""
 else
     command -v sudo &>/dev/null \
-        || fail "Root-Rechte erforderlich, sudo ist nicht installiert (typisch für Debian-Minimal). Als root anmelden mit 'su -' (mit Bindestrich) und Skript erneut starten – sudo wird dabei mitinstalliert."
+        || fail "Root-Rechte erforderlich, sudo ist nicht installiert (typisch für Debian-Minimal). Als root anmelden mit 'su -' (mit Bindestrich) und Skript erneut starten."
     SUDO="sudo"
 fi
 
@@ -184,7 +184,7 @@ log_step "Pakete installieren (Basiswerkzeuge, PostgreSQL)"
 
 run "Paketlisten aktualisiert (bei Fehler: Repo-/Proxy-Einstellung für apt prüfen)" $SUDO apt-get update
 run "Pakete installiert" $SUDO env DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y sudo iproute2 procps ca-certificates curl gnupg chrony cron bind9-dnsutils netcat-openbsd less postgresql
+    apt-get install -y iproute2 procps ca-certificates curl gnupg chrony cron bind9-dnsutils netcat-openbsd less postgresql
 
 # ---------- Schritt 2: Zeit synchronisieren ----------
 log_step "Zeitzone und Zeitsynchronisation"
@@ -283,7 +283,6 @@ log_step "Zusammenfassung"
 log_ok "PostgreSQL ${PG_VER} – Datenbank ${DB_NAME}, Benutzer ${DB_USER}"
 log_ok "Erreichbar: ${DB_LISTEN_IP}:5432, nur von ${APP_IP}"
 log_ok "Backup: täglich 02:30 nach ${BACKUP_DIR}"
-log_warn "sudo ist installiert – Admin-Benutzer bei Bedarf berechtigen: usermod -aG sudo <benutzer>"
 echo
 echo -e "  ${C_BOLD}Für das App-Server-Skript übernehmen:${C_RESET}"
 echo "    DB_HOST=\"${DB_LISTEN_IP}\""
