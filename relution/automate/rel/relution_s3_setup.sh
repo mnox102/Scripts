@@ -146,7 +146,7 @@ if [[ $EUID -eq 0 ]]; then
     SUDO=""
 else
     command -v sudo &>/dev/null \
-        || fail "Root-Rechte erforderlich, sudo ist nicht installiert (typisch für Debian-Minimal). Als root anmelden mit 'su -' (mit Bindestrich) und Skript erneut starten – sudo wird dabei mitinstalliert."
+        || fail "Root-Rechte erforderlich, sudo ist nicht installiert (typisch für Debian-Minimal). Als root anmelden mit 'su -' (mit Bindestrich) und Skript erneut starten."
     SUDO="sudo"
 fi
 
@@ -184,7 +184,7 @@ log_step "Basiswerkzeuge und Zeitsynchronisation"
 
 run "Paketlisten aktualisiert (bei Fehler: Repo-/Proxy-Einstellung für apt prüfen)" $SUDO apt-get update
 run "Pakete installiert" $SUDO env DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y sudo iproute2 procps ca-certificates curl gnupg chrony cron bind9-dnsutils netcat-openbsd less iptables
+    apt-get install -y iproute2 procps ca-certificates curl gnupg chrony cron bind9-dnsutils netcat-openbsd less iptables
 run "Zeitzone Europe/Berlin" $SUDO timedatectl set-timezone Europe/Berlin
 run "chrony aktiviert" $SUDO systemctl enable --now chrony
 
@@ -346,7 +346,6 @@ log_step "Zusammenfassung"
 log_ok "SeaweedFS: $($SUDO docker inspect -f '{{.Config.Image}} – {{.State.Status}}' seaweedfs 2>/dev/null)"
 log_ok "S3-Endpunkt: http://${FS_IP}:8333, Bucket ${S3_BUCKET}"
 log_ok "Daten: ${DATA_DIR} (in die VM-Sicherung aufnehmen!)"
-log_warn "sudo ist installiert – Admin-Benutzer bei Bedarf berechtigen: usermod -aG sudo <benutzer>"
 echo
 echo -e "  ${C_BOLD}Für das App-Server-Skript übernehmen:${C_RESET}"
 echo "    FS_HOST=\"${FS_IP}\""
