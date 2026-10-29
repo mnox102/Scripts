@@ -176,7 +176,7 @@ if [[ $EUID -eq 0 ]]; then
     SUDO=""
 else
     command -v sudo &>/dev/null \
-        || fail "Root-Rechte erforderlich, sudo ist nicht installiert (typisch für Debian-Minimal). Als root anmelden mit 'su -' (mit Bindestrich) und Skript erneut starten – sudo wird dabei mitinstalliert."
+        || fail "Root-Rechte erforderlich, sudo ist nicht installiert (typisch für Debian-Minimal). Als root anmelden mit 'su -' (mit Bindestrich) und Skript erneut starten."
     SUDO="sudo"
 fi
 
@@ -219,7 +219,7 @@ log_step "Basiswerkzeuge und Zeitsynchronisation"
 
 run "Paketlisten aktualisiert (bei Fehler: Repo-/Proxy-Einstellung für apt prüfen)" $SUDO apt-get update
 run "Pakete installiert" $SUDO env DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y sudo iproute2 procps ca-certificates curl gnupg chrony cron bind9-dnsutils netcat-openbsd less openssl postgresql-client
+    apt-get install -y iproute2 procps ca-certificates curl gnupg chrony cron bind9-dnsutils netcat-openbsd less openssl postgresql-client
 run "Zeitzone Europe/Berlin" $SUDO timedatectl set-timezone Europe/Berlin
 run "chrony aktiviert" $SUDO systemctl enable --now chrony
 
@@ -473,7 +473,6 @@ log_ok "Relution: $($SUDO docker inspect -f '{{.Config.Image}} – {{.State.Stat
 log_ok "Geräte/Portal: https://${EXT_HOSTNAME}${PORTAL_HOSTNAME:+  ·  Portal intern: https://${PORTAL_HOSTNAME}}"
 log_ok "Login: admin / Passwort in ${BASE_DIR}/secrets/system_admin_password (root)"
 log_warn "Admin-Passwort nach dem ersten Login ändern."
-log_warn "sudo ist installiert – Admin-Benutzer bei Bedarf berechtigen: usermod -aG sudo <benutzer>"
 log_warn "Funktionstest: App > 512 KB hochladen -> Objekt muss im Bucket '${S3_BUCKET}' erscheinen."
 log_warn "Danach Image auf die laufende Version pinnen (statt :latest), siehe 'docker inspect relution'."
 echo -e "\n${C_GREEN}${C_BOLD}Relution-Installation erfolgreich abgeschlossen!${C_RESET}"
